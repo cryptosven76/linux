@@ -2331,6 +2331,8 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		if (WARN_ON(!S_ISREG(inode->i_mode)))
 			return -EIO;
 		is_truncate = true;
+		/* Staged writes before the truncate, not over it */
+		fuse_splice_batch_flush(inode);
 	}
 
 	if (FUSE_IS_DAX(inode) && is_truncate) {

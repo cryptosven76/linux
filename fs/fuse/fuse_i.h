@@ -262,6 +262,13 @@ struct fuse_inode {
 			 */
 			unsigned int write_size_ewma;
 			unsigned int write_stream_run;
+
+			/*
+			 * Splice writes staged for one FUSE_WRITE, see
+			 * fuse_splice_batch_write().  Protected by
+			 * inode->i_rwsem held exclusive.
+			 */
+			struct fuse_splice_batch *splice_batch;
 		};
 
 		/* readdir cache (directory only) */
@@ -414,6 +421,17 @@ struct fuse_file {
 	 */
 	loff_t splice_run_start;
 	loff_t splice_run_next;
+
+	/*
+	 * The task whose splice write is in ->write_iter() and may be staged
+	 * in a batch, and whether its caller said more follows.  Hints, read
+	 * and written without a lock.
+	 */
+	struct task_struct *splice_batch_task;
+	bool splice_batch_more;
+
+	/* Error of a staged write sent after its splice returned */
+	int splice_batch_err;
 
 	/** Has flock been performed on this file? */
 	bool flock:1;
@@ -1692,6 +1710,7 @@ __poll_t fuse_file_poll(struct file *file, poll_table *wait);
 int fuse_dev_release(struct inode *inode, struct file *file);
 
 bool fuse_write_update_attr(struct inode *inode, loff_t pos, ssize_t written);
+int fuse_splice_batch_flush(struct inode *inode);
 
 int fuse_flush_times(struct inode *inode, struct fuse_file *ff);
 int fuse_write_inode(struct inode *inode, struct writeback_control *wbc);

@@ -27,6 +27,7 @@
 #include <linux/iomap.h>
 #include <linux/uaccess.h>
 #include <linux/sizes.h>
+#include <linux/task_work.h>
 
 int sb_init_dio_done_wq(struct super_block *sb);
 
@@ -631,6 +632,8 @@ static void fuse_sync_writes(struct inode *inode)
 	fuse_release_nowrite(inode);
 }
 
+static int fuse_splice_batch_flush_unlocked(struct inode *inode);
+
 static int fuse_flush(struct file *file, fl_owner_t id)
 {
 	struct inode *inode = file_inode(file);
@@ -643,8 +646,9 @@ static int fuse_flush(struct file *file, fl_owner_t id)
 	if (fuse_is_bad(inode))
 		return -EIO;
 
+	err = fuse_splice_batch_flush_unlocked(inode);
 	if (ff->open_flags & FOPEN_NOFLUSH && !fm->fc->writeback_cache)
-		return 0;
+		return err;
 
 	err = write_inode_now(inode, 1);
 	if (err)
@@ -715,6 +719,9 @@ static int fuse_fsync(struct file *file, loff_t start, loff_t end,
 		return -EIO;
 
 	inode_lock(inode);
+
+	/* Its error is in the mapping, for file_check_and_advance_wb_err() */
+	fuse_splice_batch_flush(inode);
 
 	/*
 	 * Start writeback against all dirty pages of the inode, then
@@ -1876,6 +1883,295 @@ static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii,
 }
 
 /*
+ * Without the writeback cache, every pipe's worth that sendfile(2) or the
+ * copy_file_range() fallback hands over is otherwise one synchronous
+ * FUSE_WRITE: 64 KiB through the internal pipe of do_splice_direct().  With
+ * splice_write_batch set, consecutive rounds are staged in the page cache as
+ * fuse_perform_write() would fill it, and sent as one FUSE_WRITE that ends on
+ * a boundary of the largest power of two a request carries, so that the server
+ * gets whole erasure-coded buckets instead of narrow 64 KiB stripes.
+ *
+ * Staged bytes are sent when the batch reaches that boundary, when the caller
+ * says nothing more follows, when a round does not continue the batch, before
+ * another cached or O_DIRECT write, an fsync, close or truncate of the inode,
+ * before a splice read of it, and at the latest when the task returns to user
+ * space, or exits.  By then sendfile() has returned its count, so an error of
+ * that last send is kept with mapping_set_error() for fsync and close, and
+ * returned by the next write through the same file.
+ *
+ * Off by default: it moves the error of up to one batch past the return of
+ * the call that wrote it, which a mount without the writeback cache does not
+ * otherwise do.
+ */
+static bool splice_write_batch;
+module_param(splice_write_batch, bool, 0644);
+MODULE_PARM_DESC(splice_write_batch,
+		 "Batch sendfile and splice-copy writes up to max_write without writeback cache");
+
+struct fuse_splice_batch {
+	struct callback_head work;
+	struct file *file;
+	struct task_struct *owner;
+	loff_t pos;
+	size_t count;
+	unsigned int max_folios;
+	struct fuse_io_args ia;
+};
+
+static bool fuse_splice_batch_wanted(struct pipe_inode_info *pipe,
+				     struct file *out)
+{
+	struct fuse_file *ff = out->private_data;
+	struct inode *inode = file_inode(out);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+
+	/*
+	 * Only do_splice_direct() rounds: they come from one call, which the
+	 * task_work sending the rest is bound to.  Kernel threads such as
+	 * nfsd never return to user space to run it.
+	 */
+	return READ_ONCE(splice_write_batch) && !fc->writeback_cache &&
+	       fc->big_writes && pipe == current->splice_pipe &&
+	       !(current->flags & (PF_KTHREAD | PF_IO_WORKER)) &&
+	       !(out->f_flags & (O_DIRECT | O_DSYNC | O_APPEND)) &&
+	       !IS_SYNC(inode) && !(ff->open_flags & FOPEN_DIRECT_IO) &&
+	       !fuse_inode_force_dio(inode) &&
+	       !(inode->i_mode & (S_ISUID | S_ISGID));
+}
+
+static loff_t fuse_splice_batch_end(struct fuse_conn *fc, loff_t pos)
+{
+	size_t cap = min_t(size_t, fc->max_write,
+			   (size_t)fc->max_pages << PAGE_SHIFT);
+	loff_t align = rounddown_pow_of_two(cap);
+
+	return round_down(pos, align) + align;
+}
+
+static int fuse_splice_batch_send(struct fuse_splice_batch *b)
+{
+	struct address_space *mapping = b->file->f_mapping;
+	struct inode *inode = mapping->host;
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_args_pages *ap = &b->ia.ap;
+	struct folio **folios = ap->folios;
+	struct fuse_folio_desc *descs = ap->descs;
+	loff_t pos = b->pos;
+	size_t count = b->count;
+	bool detached = false;
+	ssize_t written = 0;
+	struct kiocb kiocb;
+	unsigned int i;
+	int err;
+
+	if (!count)
+		return 0;
+
+	/*
+	 * An invalidate may have dropped a staged folio, and a reader may then
+	 * have cached what the server held before this write.
+	 */
+	for (i = 0; i < ap->num_folios; i++)
+		if (READ_ONCE(folios[i]->mapping) != mapping)
+			detached = true;
+
+	if (pos + count > i_size_read(inode))
+		set_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
+
+	init_sync_kiocb(&kiocb, b->file);
+	err = fuse_send_write_pages(&b->ia, &kiocb, inode, pos, count);
+	if (!err) {
+		written = b->ia.write.out.size;
+		if (written != count)
+			err = -EIO;
+	}
+	fuse_write_update_attr(inode, pos + written, written);
+	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
+
+	if (detached)
+		invalidate_inode_pages2_range(mapping, pos >> PAGE_SHIFT,
+					      (pos + count - 1) >> PAGE_SHIFT);
+	if (err)
+		mapping_set_error(mapping, err);
+
+	memset(&b->ia, 0, sizeof(b->ia));
+	ap->folios = folios;
+	ap->descs = descs;
+	/* The caller may already be gone; a fatal signal must not drop it. */
+	ap->args.force = true;
+	b->count = 0;
+
+	return err;
+}
+
+/*
+ * Send what is staged on @inode, for an operation that has to find it on the
+ * server.  An error goes to the next write of the file that staged it.
+ */
+int fuse_splice_batch_flush(struct inode *inode)
+{
+	struct fuse_splice_batch *b = get_fuse_inode(inode)->splice_batch;
+	struct fuse_file *ff;
+	int err;
+
+	if (!b)
+		return 0;
+
+	lockdep_assert_held_write(&inode->i_rwsem);
+	err = fuse_splice_batch_send(b);
+	if (err) {
+		ff = b->file->private_data;
+		WRITE_ONCE(ff->splice_batch_err, err);
+	}
+	return err;
+}
+
+static int fuse_splice_batch_flush_unlocked(struct inode *inode)
+{
+	int err;
+
+	if (likely(!READ_ONCE(get_fuse_inode(inode)->splice_batch)))
+		return 0;
+
+	inode_lock(inode);
+	err = fuse_splice_batch_flush(inode);
+	inode_unlock(inode);
+	return err;
+}
+
+static void fuse_splice_batch_done(struct callback_head *work)
+{
+	struct fuse_splice_batch *b =
+		container_of(work, struct fuse_splice_batch, work);
+	struct inode *inode = file_inode(b->file);
+
+	inode_lock(inode);
+	fuse_splice_batch_flush(inode);
+	WRITE_ONCE(get_fuse_inode(inode)->splice_batch, NULL);
+	inode_unlock(inode);
+
+	kfree(b->ia.ap.folios);
+	fput(b->file);
+	kfree(b);
+}
+
+static struct fuse_splice_batch *fuse_splice_batch_alloc(struct file *file)
+{
+	struct fuse_conn *fc = get_fuse_conn(file_inode(file));
+	struct fuse_args_pages *ap;
+	struct fuse_splice_batch *b;
+
+	b = kzalloc(sizeof(*b), GFP_KERNEL);
+	if (!b)
+		return NULL;
+
+	ap = &b->ia.ap;
+	ap->folios = fuse_folios_alloc(fc->max_pages, GFP_KERNEL, &ap->descs);
+	if (!ap->folios) {
+		kfree(b);
+		return NULL;
+	}
+	ap->args.force = true;
+	b->max_folios = fc->max_pages;
+	b->owner = current;
+	b->file = get_file(file);
+
+	/* Runs on the way back to user space, and on exit. */
+	init_task_work(&b->work, fuse_splice_batch_done);
+	if (task_work_add(current, &b->work, TWA_RESUME)) {
+		fput(b->file);
+		kfree(ap->folios);
+		kfree(b);
+		return NULL;
+	}
+	return b;
+}
+
+/*
+ * Stage one splice round in the batch of its inode, sending the batch each
+ * time it reaches its boundary.  Called with inode->i_rwsem held exclusive.
+ */
+static ssize_t fuse_splice_batch_write(struct kiocb *iocb,
+				       struct iov_iter *from, bool more)
+{
+	struct file *file = iocb->ki_filp;
+	struct address_space *mapping = file->f_mapping;
+	struct inode *inode = mapping->host;
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_splice_batch *b = fi->splice_batch;
+	loff_t pos = iocb->ki_pos;
+	ssize_t written = 0;
+	int err = 0;
+
+	/* One batch per inode: another task's writes go through it. */
+	if (b && b->owner != current) {
+		fuse_splice_batch_flush(inode);
+		return fuse_perform_write(iocb, from, 0);
+	}
+
+	if (b && b->pos + b->count != pos) {
+		err = fuse_splice_batch_send(b);
+		if (err)
+			return err;
+	}
+
+	if (!b) {
+		if (!more)
+			return fuse_perform_write(iocb, from, 0);
+		b = fuse_splice_batch_alloc(file);
+		if (!b)
+			return fuse_perform_write(iocb, from, 0);
+		WRITE_ONCE(fi->splice_batch, b);
+	}
+
+	while (iov_iter_count(from)) {
+		size_t left = iov_iter_count(from);
+		ssize_t count;
+		loff_t end;
+
+		if (!b->count)
+			b->pos = pos;
+		end = fuse_splice_batch_end(fc, b->pos);
+
+		iov_iter_truncate(from, end - pos);
+		count = fuse_fill_write_pages(&b->ia, mapping, from, pos,
+					      b->max_folios);
+		iov_iter_reexpand(from, left - max_t(ssize_t, count, 0));
+		if (count <= 0) {
+			err = count ?: -EIO;
+			break;
+		}
+
+		b->count += count;
+		pos += count;
+		written += count;
+
+		/*
+		 * A partly written folio that is not uptodate stays locked
+		 * until it is sent; the next round would lock it again.
+		 */
+		if (b->ia.write.folio_locked || pos == end ||
+		    b->ia.ap.num_folios == b->max_folios) {
+			err = fuse_splice_batch_send(b);
+			if (err)
+				return err;
+		}
+	}
+
+	if (!more && !err) {
+		err = fuse_splice_batch_send(b);
+		if (err)
+			return err;
+	}
+
+	if (!written)
+		return err;
+	iocb->ki_pos = pos;
+	return written;
+}
+
+/*
  * @return true if an exclusive lock for direct IO writes is needed
  */
 static bool fuse_dio_wr_exclusive_lock(struct kiocb *iocb, struct iov_iter *from)
@@ -2151,10 +2447,13 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	ssize_t err, count;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_file *ff = file->private_data;
 	struct fuse_range_lock rlock;
 	bool writeback = false;
 	bool stream = false;
 	bool through = false;
+	bool batch = false;
+	bool more = false;
 	bool range_locked = false;
 	bool exclusive = true;
 	loff_t dlm_pos = 0;
@@ -2247,6 +2546,14 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	 */
 	through = stream && fc->big_writes &&
 		  iov_iter_count(from) >= FUSE_WRITE_STREAM_MIN;
+
+	/* A round of fuse_splice_write() that may be staged; see there. */
+	if (!fc->writeback_cache &&
+	    READ_ONCE(ff->splice_batch_task) == current &&
+	    iov_iter_is_bvec(from) && is_sync_kiocb(iocb)) {
+		batch = true;
+		more = READ_ONCE(ff->splice_batch_more);
+	}
 
 	exclusive = fuse_cache_wr_exclusive_lock(iocb, writeback);
 
@@ -2469,6 +2776,14 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		return fuse_direct_write_iter(iocb, from);
 	}
 
+	if (!fc->writeback_cache) {
+		err = xchg(&ff->splice_batch_err, 0);
+		if (err)
+			goto out;
+		if (!batch)
+			fuse_splice_batch_flush(inode);
+	}
+
 	task_io_account_write(count);
 
 	if (iocb->ki_flags & IOCB_DIRECT) {
@@ -2580,6 +2895,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			err = written;
 			goto out;
 		}
+	} else if (batch) {
+		written = fuse_splice_batch_write(iocb, from, more);
 	} else {
 		written = fuse_perform_write(iocb, from, 0);
 	}
@@ -2959,8 +3276,10 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
 	if (fuse_file_passthrough(ff) && !(ff->open_flags & FOPEN_DIRECT_IO))
 		return fuse_passthrough_splice_read(in, ppos, pipe, len, flags);
-	else
-		return copy_splice_read(in, ppos, pipe, len, flags);
+
+	/* sendfile() within one file reads back what it staged. */
+	fuse_splice_batch_flush_unlocked(file_inode(in));
+	return copy_splice_read(in, ppos, pipe, len, flags);
 }
 
 /*
@@ -3028,13 +3347,28 @@ static ssize_t fuse_splice_write(struct pipe_inode_info *pipe, struct file *out,
 				 loff_t *ppos, size_t len, unsigned int flags)
 {
 	struct fuse_file *ff = out->private_data;
+	bool batch;
+	ssize_t ret;
 
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
 	if (fuse_file_passthrough(ff) && !(ff->open_flags & FOPEN_DIRECT_IO))
 		return fuse_passthrough_splice_write(pipe, out, ppos, len, flags);
 
 	fuse_splice_write_grant_ahead(out, *ppos, len, flags);
-	return iter_file_splice_write(pipe, out, ppos, len, flags);
+
+	/*
+	 * ->write_iter() does not see the splice flags: tell it which task's
+	 * write may be staged, and whether more follows.
+	 */
+	batch = fuse_splice_batch_wanted(pipe, out);
+	if (batch) {
+		WRITE_ONCE(ff->splice_batch_more, !!(flags & SPLICE_F_MORE));
+		WRITE_ONCE(ff->splice_batch_task, current);
+	}
+	ret = iter_file_splice_write(pipe, out, ppos, len, flags);
+	if (batch)
+		WRITE_ONCE(ff->splice_batch_task, NULL);
+	return ret;
 }
 
 static void fuse_writepage_free(struct fuse_writepage_args *wpa)
@@ -5108,6 +5442,7 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	fi->notify_interval_ewma = FUSE_NOTIFY_EWMA_SEED << FUSE_NOTIFY_EWMA_SHIFT;
 	fi->write_size_ewma = 0;
 	fi->write_stream_run = 0;
+	fi->splice_batch = NULL;
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);
